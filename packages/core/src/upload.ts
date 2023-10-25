@@ -7,7 +7,7 @@ import { createArgosApiClient, getBearerToken } from "./api-client";
 import { upload as uploadToS3 } from "./s3";
 import { debug, debugTime, debugTimeEnd } from "./debug";
 import { chunk } from "./util/chunk";
-import { readMetadata } from "@argos-ci/util";
+import { getPlaywrightTracePath, readMetadata } from "@argos-ci/util";
 
 /**
  * Size of the chunks used to upload screenshots to Argos.
@@ -113,12 +113,25 @@ export const upload = async (params: UploadParameters) => {
   // Optimize & compute hashes
   const screenshots = await Promise.all(
     foundScreenshots.map(async (screenshot) => {
-      const [metadata, optimizedPath] = await Promise.all([
+      const [metadata, pwTracePath, optimizedPath] = await Promise.all([
         readMetadata(screenshot.path),
+        getPlaywrightTracePath(screenshot.path),
         optimizeScreenshot(screenshot.path),
       ]);
-      const hash = await hashFile(optimizedPath);
-      return { ...screenshot, metadata, optimizedPath, hash };
+      const [hash, pwTraceHash] = await Promise.all([
+        hashFile(optimizedPath),
+        pwTracePath ? hashFile(pwTracePath) : null,
+      ]);
+      return {
+        ...screenshot,
+        hash,
+        optimizedPath,
+        metadata,
+        pwTrace:
+          pwTracePath && pwTraceHash
+            ? { path: pwTracePath, hash: pwTraceHash }
+            : null,
+      };
     }),
   );
 
@@ -132,6 +145,16 @@ export const upload = async (params: UploadParameters) => {
     parallelNonce: config.parallelNonce,
     screenshotKeys: Array.from(
       new Set(screenshots.map((screenshot) => screenshot.hash)),
+    ),
+    pwTraces: Array.from(
+      new Set(
+        screenshots
+          .filter((screenshot) => screenshot.pwTrace)
+          .map((screenshot) => ({
+            screenshotKey: screenshot.hash,
+            traceKey: screenshot.pwTrace!.hash,
+          })),
+      ),
     ),
     prNumber: config.prNumber,
     prHeadCommit: config.prHeadCommit,
@@ -147,19 +170,37 @@ export const upload = async (params: UploadParameters) => {
   debug(`Starting upload of ${chunks.length} chunks`);
 
   for (let i = 0; i < chunks.length; i++) {
+    // Upload screenshots
     debug(`Uploading chunk ${i + 1}/${chunks.length}`);
     const timeLabel = `Chunk ${i + 1}/${chunks.length}`;
     debugTime(timeLabel);
     await Promise.all(
-      chunks[i].map(async ({ key, putUrl }) => {
+      chunks[i].map(async ({ key, putUrl, putTraceUrl }) => {
         const screenshot = screenshots.find((s) => s.hash === key);
         if (!screenshot) {
           throw new Error(`Invariant: screenshot with hash ${key} not found`);
         }
-        await uploadToS3({
-          url: putUrl,
-          path: screenshot.optimizedPath,
-        });
+        await Promise.all([
+          // Upload screenshot
+          uploadToS3({
+            url: putUrl,
+            path: screenshot.optimizedPath,
+          }),
+          // Upload trace
+          (async () => {
+            if (screenshot.pwTrace) {
+              if (!putTraceUrl) {
+                throw new Error(
+                  `Invariant: screenshot with hash ${key} has a trace but no putTraceUrl`,
+                );
+              }
+              await uploadToS3({
+                url: putTraceUrl,
+                path: screenshot.pwTrace.path,
+              });
+            }
+          })(),
+        ]);
       }),
     );
     debugTimeEnd(timeLabel);
@@ -173,6 +214,7 @@ export const upload = async (params: UploadParameters) => {
       key: screenshot.hash,
       name: screenshot.name,
       metadata: screenshot.metadata,
+      pwTraceKey: screenshot.pwTrace?.hash ?? null,
     })),
     parallel: config.parallel,
     parallelTotal: config.parallelTotal,

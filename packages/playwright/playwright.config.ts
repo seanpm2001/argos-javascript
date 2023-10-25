@@ -4,9 +4,10 @@ import type { ArgosReporterOptions } from "@argos-ci/playwright/reporter";
 const defaultReporters: PlaywrightTestConfig["reporter"] = [["list"]];
 
 export default defineConfig({
+  retries: 2,
   use: {
     screenshot: "only-on-failure",
-    trace: "on",
+    trace: "retain-on-failure",
   },
   projects: [
     {
